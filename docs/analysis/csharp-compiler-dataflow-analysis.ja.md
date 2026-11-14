@@ -383,7 +383,147 @@ BoundTreeVisitor
 
 ## 8. Null 許容フロー解析 `NullableWalker`
 
-(§8 は別途記載)
+`NullableWalker.cs`（14,527 行）＋ `NullableWalker_Patterns.cs`（1,275）, `.Variables.cs`（436）, `.SnapshotManager.cs`（276）, `.DebugVerifier.cs`（464）, `.PlaceholderLocal.cs`（76）。
+`internal sealed partial class NullableWalker : LocalDataFlowPass<NullableWalker.LocalState, NullableWalker.LocalFunctionState>`（`:26-27`）。確定代入と同じ基盤の上に乗っているが、**型推論・変換・属性解釈までやり直す「第 2 の意味解析器」**とでも言うべき規模を持つ。
+
+### 8.1 格子と状態表現
+
+フロー状態 `NullableFlowState`（`Symbols/NullableFlowState.cs`）は 3 値:
+
+| 値 | ビット値 | 意味 |
+|---|---|---|
+| `NotNull` | `0b00` | null でない |
+| `MaybeNull` | `0b01` | null かもしれない（`T?` の null） |
+| `MaybeDefault` | `0b11` | `default(T)` かもしれない（制約なし型パラメータ `T` 用） |
+
+`Join` = 大きい方（より弱い情報）、`Meet` = 小さい方（`NullableFlowStateExtensions.cs:21,27`）。
+
+`LocalState`（`NullableWalker.cs:14059-14460`）:
+
+```csharp
+internal struct LocalState : ILocalDataFlowState {
+    internal readonly int Id;            // Variables.Id（メソッド/ラムダのスコープ ID）
+    private readonly Boxed? _container;  // 外側スコープの状態（ラムダ/ローカル関数用）
+    private BitVector _state;            // スロットあたり 2 ビット。bit 0 = 到達可能
+    public bool Reachable => _state[0];  // :14097
+}
+```
+
+- 実際のビット符号化は `GetValue`/`SetValue`（`:14287`, `:14316`）: `(true,true)=NotNull`, `(true,false)=MaybeNull`, `(false,true)=MaybeDefault`。
+  ⚠ `:14074` のコメントは別の符号化を記述しており、**コードと食い違っている**（コメントが古い）。
+- **確定代入とは到達可能ビットの極性が逆**（DA は bit0=1 が到達不能、Nullable は bit0=1 が到達可能）。
+- 到達不能状態は 1 つだけ：`GetValue` は全スロット `NotNull` を返し、`SetValue` は無視する（`:14308`）。到達不能コードで警告が出ないのはこのため。
+- 新しいスロットの初期値は宣言型・注釈から `GetDefaultState`（`:2076`）で決まる（`string?` → MaybeNull、`string` → NotNull など）。
+- `TopState()`（`:3021`）= 全スロット宣言型由来の既定状態、`ReachableBottomState()`（`:3033`）= 全スロット NotNull。
+
+### 8.2 スロットモデル `Variables`（`NullableWalker.Variables.cs`）
+
+確定代入の平坦なスロット表と異なり、**スコープ階層を持つ**:
+
+- スロット番号 = `(id << 16) | index`（`ConstructSlot :413` / `DeconstructSlot :423`）。ラムダ/ローカル関数ごとに子 `Variables` を作り新しい ID を割り当てる（`CreateNestedMethodScope :213`）。`LocalState` は ID が違うスロットを `_container` に委譲するので、**ラムダ内の状態が外側の状態を包含**できる。
+- `VariableIdentifier(symbol, ContainingSlot)` で `a.b.c` のような**メンバパスを追跡**（クラス型のフィールド/プロパティも追跡対象。DA は構造体フィールドのみ）。
+- **`MaxSlotDepth = 5`**（`:84`）：メンバ連鎖の深さ 5 以上、またはインデックス上限を超えるとスロットを作らない（-1）。`class Node { Node? Next; }` で `a.Next.Next.Next...` が無限に増えるのを防ぐ。
+- `_variableTypes`（`:128`）に `var` ローカル等の**推論された null 許容型**を保持。
+- `PlaceholderLocal`：生成中オブジェクト（`new C { P = ... }`）やパターン入力に仮のスロットを与えるための合成ローカル。
+- `MakeSlot`（`:2174`）は `?.` の受け側（`BoundConditionalReceiver`）も `_lastConditionalAccessSlot` 経由で解決。代入時は `InheritNullableStateOfMember`（`:2825`）でメンバの状態をコピーする（`a = b;` の後 `a.P` は `b.P` の状態を引き継ぐ）。
+
+### 8.3 エントリポイントと呼び出し元
+
+| メソッド | 行 | 用途 |
+|---|---|---|
+| `AnalyzeIfNeeded(compilation, method, ...)` | 1500 | コンパイル時診断。言語バージョンと `#nullable` 文脈で有効な場合のみ実行 |
+| `AnalyzeAndRewrite` | 1653 | SemanticModel 用。解析＋ null 許容情報を埋め込んだ Bound Tree へ書き換え |
+| `AnalyzeAndRewriteSpeculation` | 1729 | 投機的 SemanticModel。スナップショットから途中状態を復元 |
+| `AnalyzeWithoutRewrite` | 1638 | nullable 無効時の検証用 |
+| `Analyze(compilation, BoundLambda, ...)` | 1850 | ラムダ戻り値型推論 |
+| `AnalyzeIfNeeded(Binder, ...)` | 1809 | 属性引数・既定値・`field` 等の単発式 |
+
+呼び出し元: `MethodCompiler.cs:1966`（`AnalyzeAndRewrite`, `createSnapshots: true`）, `:1981`, `:646`, `:1027`, `:2079`、各 `*SemanticModel.cs`、`BoundTree/UnboundLambda.cs:157` など。
+
+**IDE 連携**：解析中 `SetAnalyzedNullability`（`:388`）で各式の結果を `_analyzedNullabilityMapOpt` に記録し、`NullabilityRewriter`（`BoundTree/NullabilityRewriter.cs`）がそれを Bound Tree に反映。`SnapshotManager` は文の位置ごとに状態スナップショット（`TakeIncrementalSnapshot`, `:208`）を保存し、任意位置の投機的解析を途中から再開できる（ループ再走査で後の安定した状態が上書き）。`GetTypeInfo(...).Nullability` の値はここから来る。
+
+### 8.4 式の結果と条件状態
+
+```csharp
+readonly struct VisitResult {           // :116-140
+    TypeWithState RValueType;           // 値の型＋フロー状態（読む側）
+    TypeWithAnnotations LValueType;     // 代入可能な型＋注釈（書く側）
+    Optional<LocalState> StateForLambda;// ラムダ式を見た時点の状態
+    VisitResult[]? NestedVisitResults;
+}
+```
+直前に訪問した式の結果は `_visitResult`（`:303`）に置かれる。**注釈（annotation, 宣言の `?`）と状態（state, フロー上の現在値）を区別**するのが Nullable 設計の中核。
+
+null テストからの学習:
+
+| 構文 | 処理 |
+|---|---|
+| `x == null` / `x != null` | 二項演算子解析（`:5880-5915`）で `SplitAndLearnFromNonNullTest`（`:5946`）/ `LearnFromNullTest`（`:6100`）。`a?.b?.c == null` なら a, b, c 全てに学習 |
+| `x ?? y`, `x ??= y` | `VisitNullCoalescingOperator`（`:6249`）/ `...AssignmentOperator`（`:6212`） |
+| `x?.M()` | `VisitConditionalAccess`（`:6416`）。null 側の状態を保存し、アクセス中は受け側を NotNull に |
+| `x!` | 専用 Visit は無く、`VisitExpressionWithoutStackGuardEpilogue`（`:3828-3846`）で `IsSuppressed` なら結果を NotNull に強制。各診断箇所も `IsSuppressed` を確認 |
+| `is` / `switch` | 決定 DAG を歩く（§8.6） |
+
+**属性（`FlowAnalysisAnnotations`）の解釈**:
+
+| 属性 | 処理 |
+|---|---|
+| `[AllowNull]`/`[DisallowNull]`（事前条件） | `VisitArgumentConversionAndInboundAssignmentsAndPreConditions`（`:8293`）, `CheckDisallowedNullAssignment`（`:8382`） |
+| `[NotNull]`/`[MaybeNull]`/`[NotNullWhen]`/`[MaybeNullWhen]`（事後条件） | `LearnFromPostConditions`（`:8659`）。`When` 系は条件状態を分割 |
+| 戻り値の `[MaybeNull]`/`[NotNull]` | `ApplyUnconditionalAnnotations`（`:7535`） |
+| `[NotNullIfNotNull]` | `:7770` ほか |
+| `[MemberNotNull(When)]` | 呼び出し側 `ApplyMemberPostConditions`（`:8011`）、メソッド内では終了時に強制 |
+| `[DoesNotReturn]` | 呼び出し後 `SetUnreachable()`（`:7882`） |
+| `[DoesNotReturnIf(b)]` | 片側の条件状態のみ残す（`:8242-8270`） |
+
+`Equals`/`ReferenceEquals`/`Interlocked.CompareExchange` 等は `LearnFromEqualsMethod`（`:7185`）等で特別扱い。
+
+### 8.5 型推論のやり直し・変換・ラムダ
+
+- **ジェネリックメソッドの型引数を null 許容性込みで再推論**：`VisitCall`（`:6843`）→ `ReInferMethodAndVisitArguments`（`:7043`）→ `VisitArguments`（`:7615`）→ `InferMemberTypeArguments`（`:8786`）が `MethodTypeInferrer.Infer` を引数の null 許容型で再実行（`:8827`）。例えば `Identity(s)` の `T` は `s` が MaybeNull なら `string?` になる。その後 `CheckMethodConstraints`（`:9036`）で `notnull` 制約などを検査。演算子（`ReInferBinaryOperator :5765`）、Deconstruct、デリゲート生成も同様。
+- **変換**：`VisitConversion`（ワーカー `:9900`）が全ての暗黙/明示変換で状態を伝搬・検査（アンボクシング `WRN_UnboxPossibleNull` 等）。
+- **ラムダ**：`VisitLambda`（`:11230`）は状態を `StateForLambda` に保存するだけ。本体は **ターゲットデリゲート型が判明する変換時に解析**（`:9997-10008` → `AnalyzeLocalFunctionOrLambda :3491`）。ネストした `Variables`/`LocalState` を作り、捕捉変数は宣言時点の状態を引き継ぐ。ラムダはオーバーロード解決・戻り値推論・最終変換で複数回解析され得る（`UnboundLambda.cs:148-152` に指数的コストの注記）。
+- **ローカル関数**（`:3412`）：まだ呼び出し地点が無ければ捕捉変数を NotNull、あれば呼び出し地点の状態を Join した `StartingState` から開始。
+- **ターゲット型付き式**は `_targetTypedAnalysisCompletionOpt`（`:267`）に「後で型が分かったら完了する」関数を保存する遅延評価。
+
+### 8.6 パターン / switch（`NullableWalker_Patterns.cs`）
+
+1. `LearnFromAnyNullPatterns`（`:25`）：パターン中に `null` 定数パターンがあれば、入力を「null かもしれない」とみなす（`if (s is null)` と書いた時点で開発者は null の可能性を想定している、という学習）。
+2. `LearnFromDecisionDag`（`:377`）：**バインダが生成した決定 DAG のノードをトポロジカル順に**訪問（`:423`）し、ノードごとの状態 `nodeStateMap`（`:418`）を `Join` で合成:
+   - 評価ノード（`:439`）：プロパティ/フィールド/Deconstruct/インデクサ評価の一時値にスロットを割当（元変数のスロットを再利用するので、学んだ事実が元の変数に戻る）。
+   - テストノード（`:539`）：型テスト・非 null テストの真側で NotNull、明示 null テストの真側で MaybeNull／偽側で NotNull。
+   - `when` 節ノード（`:620`）、リーフノード（`:615`）→ ラベルごとの状態へ。
+3. `is` 式（`:1247`）は真/偽ラベルの状態から条件状態を作り、switch 文/式は各セクション/アームの状態として使う。switch 式で null が網羅されていなければ `WRN_SwitchExpressionNotExhaustiveForNull`（`:1096`）。
+
+### 8.7 メソッド終了時の検査（`Scan`, `:632-680`）
+
+`base.Scan` の後、本体末尾と全 `return` の保留分岐について:
+- `EnforceDoesNotReturn` → `WRN_ShouldNotReturn`
+- `enforceMemberNotNull`（ローカル関数）→ コンストラクタ終了時の未初期化非 null フィールド `WRN_UninitializedNonNullableField`（CS8618, `:850`）、`[MemberNotNull]` 違反 `WRN_MemberNotNull`
+- `EnforceParameterNotNullOnExit`（`:1351`）→ `[NotNull]` 引数
+- `EnforceNotNullWhenForPendingReturn`（`:1308`）→ `return true/false` や保留分岐の条件状態から `[NotNullWhen]` を検査
+
+`Scan` 冒頭で `Diagnostics.Clear()`（`:638`）するので、**不動点に達した最終パスの診断だけが残る**。
+
+### 8.8 主な診断
+
+| 診断 | 例 | 場所 |
+|---|---|---|
+| `WRN_NullReferenceReceiver` (CS8602) | null かもしれない参照の逆参照 | `CheckPossibleNullReceiver` `:13559` |
+| `WRN_NullAsNonNullable` / `WRN_NullReferenceAssignment` / `...Return` / `...Argument` (CS8625/8601/8603/8604) | null を非 null へ | `ReportNullableAssignmentIfNecessary` `:2492` |
+| `WRN_NullabilityMismatchIn*` (CS8619/8620 等) | 型引数レベルの不一致 | `:2701`, `:12167` |
+| `WRN_UninitializedNonNullableField` (CS8618) | コンストラクタ終了時 | `:850` |
+| `WRN_NullableValueTypeMayBeNull` (CS8629) | `int?` の `.Value` | `:10182` |
+| `WRN_ThrowPossibleNull` (CS8597) | `throw null` 可能性 | `:13755` |
+
+全ての nullable 警告は `ReportDiagnostic`（`:2773`）を通り、**到達可能かつ `_disableDiagnostics == false` の時だけ**報告される。引数の 2 回目の訪問などでは `_disableDiagnostics` を立てて重複報告を防ぐ。
+
+### 8.9 安全・性能機構
+
+- `MaxSlotDepth`、到達不能状態の単一化、二項演算子連鎖の反復処理（`:5476`）。
+- 深い木では `CancelledByStackGuardException` を捕捉してエラー診断化（`:564`, `:1970`）。
+- `DebugVerifier`（DEBUG ビルドのみ）：全 `BoundExpression` が解析済み null 許容マップに登録されているか検証し、SemanticModel の情報欠落を防ぐ（`:44-63`）。
+- ループ・goto・ローカル関数は基底の `stateChangedAfterUse` 再走査で不動点へ。格子が有限（3 値）かつ Join が単調なので停止する。
 
 ---
 
